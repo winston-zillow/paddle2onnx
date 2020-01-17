@@ -425,7 +425,7 @@ def elementwise_ops(op_type, operator, block):
                 post_shape.append(1)
         pre_shape.extend(shape)
         pre_shape.extend(post_shape)
-        final_shape = [i if i > 0 else 1 for i in pre_shape]
+        final_shape = [i if i > 0 else -1 for i in pre_shape]
         shape_name = _tmp_name(outputs['Out'][0], "@shape_var", block)
         output_const_node = make_node(
             'Constant',

@@ -15,13 +15,14 @@
 import os
 import sys
 import argparse
+import pickle
 
 from fluid.utils import op_io_info, init_name_prefix
 from onnx import helper, checker
 import paddle.fluid as fluid
 
 import fluid_onnx.ops as ops
-from fluid_onnx.variables import paddle_variable_to_onnx_tensor, paddle_onnx_weight
+from fluid_onnx.variables import paddle_variable_to_onnx_tensor, paddle_onnx_weight, fetch_var
 from debug.model_check import debug_model, Tracker
 
 
@@ -107,12 +108,20 @@ def convert(args):
             ]
 
         # Load parameters
+        trainables = []
+        constants = []
+        persistable_numpy_values = dict()
         weights, weights_value_info = [], []
         global_block = inference_program.global_block()
         for var_name in global_block.vars:
             var = global_block.var(var_name)
             if var_name not in feed_fetch_list\
                 and var.persistable:
+                if var.stop_gradient:
+                    constants.append(var.name)
+                else:
+                    trainables.append(var.name)
+                persistable_numpy_values[var.name] = fetch_var(var.name, inference_scope)
                 weight, val_info = paddle_onnx_weight(
                     var=var, scope=inference_scope)
                 weights.append(weight)
@@ -135,18 +144,21 @@ def convert(args):
         for block in inference_program.blocks:
             for op in block.ops:
                 if op.type in ops.node_maker:
-                    # TODO(kuke): deal with the corner case that vars in 
+                    # TODO(kuke): deal with the corner case that vars in
                     #     different blocks have the same name
                     node_proto = ops.node_maker[str(op.type)](operator=op,
                                                               block=block)
                     op_outputs = []
                     last_node = None
                     if isinstance(node_proto, tuple):
-                        onnx_nodes.extend(list(node_proto))
-                        last_node = list(node_proto)
+                        node_proto = list(node_proto)
                     else:
-                        onnx_nodes.append(node_proto)
-                        last_node = [node_proto]
+                        node_proto = [node_proto]
+                    for node in node_proto:
+                        if not node.name:
+                            node.name = node.output[0].replace('@', '_')
+                    onnx_nodes.extend(node_proto)
+                    last_node = node_proto
                     tracker = Tracker(str(op.type), last_node)
                     op_trackers.append(tracker)
                     op_check_list.append(str(op.type))
@@ -202,8 +214,14 @@ def convert(args):
             try:
                 with open(args.onnx_model, 'wb') as f:
                     f.write(onnx_model.SerializeToString())
+                with open(args.onnx_model + '.constants.txt', 'w') as f:
+                    f.write('\n'.join(constants))
+                with open(args.onnx_model + '.trainables.txt', 'w') as f:
+                    f.write('\n'.join(trainables))
+                with open(args.onnx_model + '.persistables.pkl', 'wb') as f:
+                    pickle.dump(persistable_numpy_values, f)
                 print("Saved converted model to path: %s" % args.onnx_model)
-                # If in debug mode, need to save op list, add we will check op 
+                # If in debug mode, need to save op list, add we will check op
                 if args.debug:
                     op_check_list = list(set(op_check_list))
                     check_outputs = []

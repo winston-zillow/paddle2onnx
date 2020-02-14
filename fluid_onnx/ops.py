@@ -379,25 +379,33 @@ def depthtospace_op():
 
 def dropout_op(operator, block):
     inputs, attrs, outputs = op_io_info(operator)
-    scale_input = [outputs['Out'][0] + '@dropout']
-    dropout_node = make_node(
-        'Dropout',
-        inputs=inputs['X'],
-        outputs=scale_input + outputs['Mask'],
-        ratio=attrs['dropout_prob'])
+    dropout_implementation = attrs.get('dropout_implementation', 'downgrade_in_infer')
+    if dropout_implementation == 'downgrade_in_infer':
+        scale_input = [outputs['Out'][0] + '@dropout']
+        dropout_node = make_node(
+            'Dropout',
+            inputs=inputs['X'],
+            outputs=scale_input + outputs['Mask'],
+            ratio=attrs['dropout_prob'])
 
-    ## Fluid and ONNX use different dropout formula
-    # onnx version >= 1.4.1 supports ai.onnx ver 9 which has no `broadcast` attr for Mul
-    scale_mul_attrs = {'broadcast': 1} if __onnx_ver__ < '1.4.1' else {}
-    scale_const_node = global_const(np.array(1.0 - attrs['dropout_prob'], dtype=np.float32), block)
-    return _to_node_tuple([
-        dropout_node,
-        scale_const_node.node,
-        make_node(
-            'Mul',
-            inputs=scale_input + [scale_const_node.name],
-            outputs=outputs['Out'],
-            **scale_mul_attrs)])
+        ## Fluid and ONNX use different dropout formula
+        # onnx version >= 1.4.1 supports ai.onnx ver 9 which has no `broadcast` attr for Mul
+        scale_mul_attrs = {'broadcast': 1} if __onnx_ver__ < '1.4.1' else {}
+        scale_const_node = global_const(np.array(1.0 - attrs['dropout_prob'], dtype=np.float32), block)
+        return _to_node_tuple([
+            dropout_node,
+            scale_const_node.node,
+            make_node(
+                'Mul',
+                inputs=scale_input + [scale_const_node.name],
+                outputs=outputs['Out'],
+                **scale_mul_attrs)])
+    else:
+        return make_node(
+            'Dropout',
+            inputs=inputs['X'],
+            outputs=outputs['Out'] + outputs['Mask'],
+            ratio=attrs['dropout_prob'])
 
 
 def elementwise_ops(op_type, operator, block):
@@ -589,14 +597,17 @@ def instancenormalization_op():
 
 def layer_norm_op(operator, block):
     inputs, attrs, outputs = op_io_info(operator)
+    norm_axis = attrs['begin_norm_axis']
+    norm_epsilon = np.array(attrs['epsilon'], dtype=np.float32)
+    activation = attrs.get('act', None)
     name_x = inputs['X'][0]
     name_bias = inputs['Bias'][0]
     name_scale = inputs['Scale'][0]
     name_mean = outputs['Mean'][0]
     name_variance = outputs['Variance'][0]
     name_y = outputs['Y'][0]
-    norm_axis = attrs['begin_norm_axis']
-    norm_epsilon = np.array(attrs['epsilon'], dtype=np.float32)
+    name_layer_norm = name_y if activation is None else _tmp_name(name_y, 'pre_act', block)
+
     name_x_sub_mean = _tmp_name(name_x, 'sub_mean', block)
     name_x_sub_mean_sq = _tmp_name(name_x, 'sub_mean_sq', block)
     name_x_stddev = _tmp_name(name_x, 'stddev', block)
@@ -611,12 +622,25 @@ def layer_norm_op(operator, block):
     if epsilon_node.node:
         node_list.append(epsilon_node.node)
     node_list.extend([
+        # mean
         onnx.helper.make_node(
             'ReduceMean',
             inputs=[name_x],
             outputs=[name_mean_unflatten],
             axes=[norm_axis],
             keepdims=1),
+        onnx.helper.make_node(
+            'Flatten',
+            inputs=[name_mean_unflatten],
+            outputs=[name_mean_flatten2d],
+            axis=0),
+        onnx.helper.make_node(
+            'Squeeze',
+            inputs=[name_mean_flatten2d],
+            outputs=[name_mean],
+            axes=[0]),
+
+        # variance
         onnx.helper.make_node(
             'Sub',
             inputs=[name_x, name_mean_unflatten],
@@ -634,6 +658,18 @@ def layer_norm_op(operator, block):
             axes=[norm_axis],
             keepdims=1),
         onnx.helper.make_node(
+            'Flatten',
+            inputs=[name_variance_unflatten],
+            outputs=[name_variance_flatten2d],
+            axis=0),
+        onnx.helper.make_node(
+            'Squeeze',
+            inputs=[name_variance_flatten2d],
+            outputs=[name_variance],
+            axes=[0]),
+
+        # std. dev
+        onnx.helper.make_node(
             'Add',
             inputs=[name_variance_unflatten, epsilon_node.name],
             outputs=[(name_variance + '@add_epsilon')]),
@@ -641,6 +677,8 @@ def layer_norm_op(operator, block):
             'Sqrt',
             inputs=[(name_variance + '@add_epsilon')],
             outputs=[name_x_stddev]),
+
+        # Y
         onnx.helper.make_node(
             'Div',
             inputs=[name_x_sub_mean, name_x_stddev],
@@ -652,28 +690,13 @@ def layer_norm_op(operator, block):
         onnx.helper.make_node(
             'Add',
             inputs=[name_x_norm_scaled, name_bias],
-            outputs=[name_y]),
-        onnx.helper.make_node(
-            'Flatten',
-            inputs=[name_mean_unflatten],
-            outputs=[name_mean_flatten2d],
-            axis=0),
-        onnx.helper.make_node(
-            'Flatten',
-            inputs=[name_variance_unflatten],
-            outputs=[name_variance_flatten2d],
-            axis=0),
-        onnx.helper.make_node(
-            'Squeeze',
-            inputs=[name_mean_flatten2d],
-            outputs=[name_mean],
-            axes=[0]),
-        onnx.helper.make_node(
-            'Squeeze',
-            inputs=[name_variance_flatten2d],
-            outputs=[name_variance],
-            axes=[0]),
+            outputs=[name_layer_norm]),
     ])
+    if activation is not None:
+        node_list.append(make_node(
+            activation,
+            inputs=[name_layer_norm],
+            outputs=[name_y]))
     return _to_node_tuple(node_list)
 
 
@@ -1335,25 +1358,25 @@ def scale_op(operator, block):
             data_type=onnx.TensorProto.FLOAT,
             dims=(),
             vals=[attrs['scale']]))
-    bais_var_name = [outputs['Out'][0] + "@bais"]
-    bais = 0.0
-    if 'bais' in attrs:
-        bais = float(attrs['bais'])
-    node_bais = onnx.helper.make_node(
+    bias_var_name = [outputs['Out'][0] + "@bias"]
+    bias = 0.0
+    if 'bias' in attrs:
+        bias = float(attrs['bias'])
+    node_bias = onnx.helper.make_node(
         'Constant',
         inputs=[],
-        outputs=bais_var_name,
+        outputs=bias_var_name,
         value=onnx.helper.make_tensor(
-            name=bais_var_name[0] + "@const",
+            name=bias_var_name[0] + "@const",
             data_type=onnx.TensorProto.FLOAT,
             dims=(),
-            vals=[bais]))
+            vals=[bias]))
     paddle_var = block.var(inputs["X"][0])
     tmp_var_name = outputs['Out'][0] + "@tmp"
     shape = paddle_onnx_shape(paddle_var.shape)
     tmp_var = onnx.helper.make_tensor_value_info(
         tmp_var_name, PADDLE_TO_ONNX_DTYPE[paddle_var.dtype], shape)
-    nodes = (node_scale, node_bais)
+    nodes = (node_scale, node_bias)
     if attrs['bias_after_scale'] == True:
         node_output_mul = onnx.helper.make_node(
             'Mul',
@@ -1361,13 +1384,13 @@ def scale_op(operator, block):
             outputs=[tmp_var_name])
         node_output_scale = onnx.helper.make_node(
             'Add',
-            inputs=[bais_var_name[0], tmp_var_name],
+            inputs=[bias_var_name[0], tmp_var_name],
             outputs=outputs["Out"])
         nodes += (node_output_mul, node_output_scale)
     else:
         node_output_add = onnx.helper.make_node(
             'Add',
-            inputs=[bais_var_name[0], inputs["X"][0]],
+            inputs=[bias_var_name[0], inputs["X"][0]],
             outputs=[tmp_var_name])
         node_output_mul = onnx.helper.make_node(
             'Mul',
